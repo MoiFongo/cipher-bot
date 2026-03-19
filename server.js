@@ -329,4 +329,13 @@ setInterval(async () => {
 // ===== START =====
 initDB().then(loadWeights);
 
+app.get("/", (req, res) => {
+  res.send("BOT LIVE");
+});
+
 app.listen(PORT, () => console.log("BOT RUNNING"));
+
+// ===== ROOT =====
+app.get("/", (req, res) => {
+  res.send("BOT LIVE");
+});
