@@ -23,15 +23,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// ===== INIT DB =====
 async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS weights (
-      id SERIAL PRIMARY KEY,
-      data JSONB
-    );
-  `);
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trades (
       id SERIAL PRIMARY KEY,
@@ -39,53 +31,31 @@ async function initDB() {
       entry FLOAT,
       exit FLOAT,
       profit FLOAT,
+      features JSONB,
       timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
-
-  const res = await pool.query("SELECT * FROM weights LIMIT 1");
-
-  if (res.rows.length === 0) {
-    await pool.query("INSERT INTO weights (data) VALUES ($1)", [{
-      momentum: 0.4,
-      volatility: -0.2,
-      correlation: 0.3,
-      bias: 0.1
-    }]);
-  }
 }
 
 // ===== CONFIG =====
 const PAIRS = ["BTC/USD", "ETH/USD", "SOL/USD"];
-const MAX_TRADE_USD = 5;
-const MAX_POSITIONS = 3;
-
-const STOP_LOSS = 0.985;
-const TAKE_PROFIT = 1.02;
-const SCALE_IN_THRESHOLD = 1.01;
-
-const COOLDOWN_MS = 60 * 1000;
-
-const DATA_INTERVAL = 2500;
-const TRADE_INTERVAL = 10000;
+const BASE_RISK = 0.01; // 1% base risk
+const MAX_POSITIONS = 4;
+const TRADE_INTERVAL = 7000;
 
 // ===== STATE =====
 let history = {};
 let positions = [];
-let lastTradeTime = 0;
 let tradingEnabled = true;
-let weights = {};
 
-// ===== LOAD WEIGHTS =====
-async function loadWeights() {
-  const res = await pool.query("SELECT * FROM weights LIMIT 1");
-  weights = res.rows[0].data;
-  console.log("Loaded weights:", weights);
-}
+let equity = 100; // virtual growth tracker
+let peakEquity = 100;
+let losingStreak = 0;
 
-// ===== SAVE WEIGHTS =====
-async function saveWeights() {
-  await pool.query("UPDATE weights SET data=$1 WHERE id=1", [weights]);
+// ===== AUTH =====
+function auth(req, res, next) {
+  if (req.query.token !== BOT_TOKEN) return res.status(401).send("Unauthorized");
+  next();
 }
 
 // ===== SIGN =====
@@ -108,7 +78,6 @@ function sign(path, request, secret) {
 async function privateCall(path, params = {}) {
   const nonce = Date.now().toString();
   const body = { nonce, ...params };
-  const postData = new URLSearchParams(body).toString();
   const sig = sign(path, body, SECRET);
 
   const res = await fetch(API + path, {
@@ -118,7 +87,7 @@ async function privateCall(path, params = {}) {
       "API-Sign": sig,
       "Content-Type": "application/x-www-form-urlencoded"
     },
-    body: postData
+    body: new URLSearchParams(body)
   });
 
   const data = await res.json();
@@ -126,97 +95,111 @@ async function privateCall(path, params = {}) {
   return data.result;
 }
 
-// ===== GET PRICES =====
-async function getAllPrices() {
+// ===== MARKET =====
+async function getMarket() {
   const pairs = PAIRS.map(p => p.replace("/", "")).join(",");
   const res = await fetch(`${API}/0/public/Ticker?pair=${pairs}`);
   const data = await res.json();
 
-  let prices = {};
+  let out = {};
   let i = 0;
 
   for (const key in data.result) {
-    prices[PAIRS[i]] = parseFloat(data.result[key].c[0]);
+    out[PAIRS[i]] = {
+      price: parseFloat(data.result[key].c[0]),
+      volume: parseFloat(data.result[key].v[1])
+    };
     i++;
   }
 
-  return prices;
+  return out;
 }
 
 // ===== HISTORY =====
-function updateHistory(pair, price) {
-  if (!history[pair]) history[pair] = [];
-  history[pair].push(price);
-  if (history[pair].length > 30) history[pair].shift();
+function updateHistory(pair, price, volume) {
+  if (!history[pair]) history[pair] = { prices: [], volumes: [] };
+
+  history[pair].prices.push(price);
+  history[pair].volumes.push(volume);
+
+  if (history[pair].prices.length > 60) {
+    history[pair].prices.shift();
+    history[pair].volumes.shift();
+  }
 }
 
 // ===== FEATURES =====
-function extractFeatures(pair) {
+function features(pair) {
   const h = history[pair];
-  if (!h || h.length < 6) return null;
+  if (!h || h.prices.length < 20) return null;
 
-  const returns = [];
+  const prices = h.prices;
+  const volumes = h.volumes;
 
-  for (let i = 1; i < h.length; i++) {
-    returns.push((h[i] - h[i - 1]) / h[i - 1]);
+  const shortTrend = (prices.slice(-5)[4] - prices.slice(-5)[0]) / prices.slice(-5)[0];
+  const longTrend = (prices.slice(-20)[19] - prices.slice(-20)[0]) / prices.slice(-20)[0];
+
+  const volAvg = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+  const whale = volumes.slice(-1)[0] > volAvg * 1.8;
+
+  return { shortTrend, longTrend, whale };
+}
+
+// ===== ML =====
+async function predict(f) {
+  const res = await pool.query("SELECT * FROM trades");
+
+  if (res.rows.length < 15) return 0.6;
+
+  let score = 0;
+  let total = 0;
+
+  for (const t of res.rows) {
+    const tf = t.features;
+
+    const sim =
+      1 -
+      Math.abs(f.shortTrend - tf.shortTrend) -
+      Math.abs(f.longTrend - tf.longTrend);
+
+    if (sim > 0.5) {
+      score += t.profit;
+      total++;
+    }
   }
 
-  const momentum = (h[h.length - 1] - h[0]) / h[0];
-  const volatility = returns.reduce((a, b) => a + Math.abs(b), 0) / returns.length;
+  if (total === 0) return 0.5;
 
-  const trend = returns.filter(r => r > 0).length / returns.length;
-  const accel = returns.slice(-3).reduce((a, b) => a + b, 0);
-
-  return { momentum, volatility, trend, accel };
+  return Math.max(0, Math.min(1, 0.5 + score / total));
 }
 
-// ===== CORRELATION =====
-function correlation(a, b) {
-  if (!a || !b || a.length !== b.length || a.length < 5) return 0;
+// ===== RISK ENGINE =====
+function calcPositionSize(confidence) {
+  let risk = BASE_RISK;
 
-  const avgA = a.reduce((x, y) => x + y) / a.length;
-  const avgB = b.reduce((x, y) => x + y) / b.length;
+  // scale with confidence
+  risk *= confidence;
 
-  let num = 0, denA = 0, denB = 0;
+  // reduce risk on losing streak
+  if (losingStreak >= 3) risk *= 0.5;
 
-  for (let i = 0; i < a.length; i++) {
-    num += (a[i] - avgA) * (b[i] - avgB);
-    denA += (a[i] - avgA) ** 2;
-    denB += (b[i] - avgB) ** 2;
-  }
+  // drawdown protection
+  const dd = equity / peakEquity;
+  if (dd < 0.9) risk *= 0.5;
 
-  return num / Math.sqrt(denA * denB + 1e-8);
-}
-
-function marketCorrelation() {
-  return (
-    correlation(history["BTC/USD"], history["ETH/USD"]) +
-    correlation(history["BTC/USD"], history["SOL/USD"])
-  ) / 2;
-}
-
-// ===== SCORE =====
-function score(f, corr) {
-  return (
-    weights.momentum * f.momentum +
-    weights.volatility * f.volatility +
-    weights.correlation * corr +
-    weights.bias +
-    0.4 * f.trend +
-    0.3 * f.accel
-  );
+  return risk;
 }
 
 // ===== BUY =====
-async function buy(pair) {
-  if (!tradingEnabled) return;
-  if (positions.length >= MAX_POSITIONS) return;
+async function buy(pair, conf, f) {
+  if (!tradingEnabled || positions.length >= MAX_POSITIONS) return;
 
-  const now = Date.now();
-  if (now - lastTradeTime < COOLDOWN_MS) return;
+  const price = history[pair].prices.slice(-1)[0];
 
-  const price = history[pair].slice(-1)[0];
-  const volume = (MAX_TRADE_USD / price).toFixed(8);
+  const risk = calcPositionSize(conf);
+  const capital = equity * risk;
+
+  const volume = (capital / price).toFixed(8);
 
   await privateCall("/0/private/AddOrder", {
     pair,
@@ -229,17 +212,15 @@ async function buy(pair) {
     pair,
     entry: price,
     volume,
-    features: extractFeatures(pair),
-    corr: marketCorrelation(),
-    scaled: false
+    peak: price,
+    features: f,
+    confidence: conf,
+    capital
   });
-
-  lastTradeTime = now;
-  console.log("BOUGHT:", pair);
 }
 
-// ===== SELL =====
-async function closePosition(pos, price) {
+// ===== CLOSE =====
+async function close(pos, price) {
   await privateCall("/0/private/AddOrder", {
     pair: pos.pair,
     type: "sell",
@@ -248,154 +229,107 @@ async function closePosition(pos, price) {
   });
 
   const profit = (price - pos.entry) / pos.entry;
-  const lr = 0.05;
 
-  weights.momentum += lr * profit * pos.features.momentum;
-  weights.volatility += lr * profit * pos.features.volatility;
-  weights.correlation += lr * profit * pos.corr;
+  equity *= (1 + profit);
 
-  await saveWeights();
+  if (equity > peakEquity) peakEquity = equity;
+
+  if (profit < 0) losingStreak++;
+  else losingStreak = 0;
 
   await pool.query(
-    "INSERT INTO trades (pair, entry, exit, profit) VALUES ($1,$2,$3,$4)",
-    [pos.pair, pos.entry, price, profit]
+    "INSERT INTO trades (pair, entry, exit, profit, features) VALUES ($1,$2,$3,$4,$5)",
+    [pos.pair, pos.entry, price, profit, pos.features]
   );
-
-  console.log("SOLD:", pos.pair, profit);
 }
 
-// ===== LOOPS =====
-
-// FAST DATA
+// ===== LOOP =====
 setInterval(async () => {
-  try {
-    const prices = await getAllPrices();
-    for (const pair of PAIRS) updateHistory(pair, prices[pair]);
-  } catch (e) {
-    console.log("Data error:", e.message);
+  const market = await getMarket();
+
+  for (const pair of PAIRS) {
+    updateHistory(pair, market[pair].price, market[pair].volume);
   }
-}, DATA_INTERVAL);
 
-// TRADE LOOP
-setInterval(async () => {
-  try {
-    const corr = marketCorrelation();
+  const btc = features("BTC/USD");
 
-    // ===== MANAGE POSITIONS =====
-    for (let i = positions.length - 1; i >= 0; i--) {
-      const pos = positions[i];
-      const price = history[pos.pair].slice(-1)[0];
+  // manage positions
+  for (let i = positions.length - 1; i >= 0; i--) {
+    const pos = positions[i];
+    const price = history[pos.pair].prices.slice(-1)[0];
 
-      // SCALE IN
-      if (!pos.scaled && price >= pos.entry * SCALE_IN_THRESHOLD) {
-        console.log("Scaling into", pos.pair);
-        await buy(pos.pair);
-        pos.scaled = true;
-      }
+    if (price > pos.peak) pos.peak = price;
 
-      // EXIT
-      if (
-        price >= pos.entry * TAKE_PROFIT ||
-        price <= pos.entry * STOP_LOSS
-      ) {
-        await closePosition(pos, price);
-        positions.splice(i, 1);
-      }
+    const dd = price / pos.peak;
+
+    if (dd < 0.985 || price < pos.entry * 0.99) {
+      await close(pos, price);
+      positions.splice(i, 1);
     }
-
-    // ===== NEW ENTRIES =====
-    for (const pair of PAIRS) {
-      const f = extractFeatures(pair);
-      if (!f) continue;
-
-      const s = score(f, corr);
-
-      if (
-        s > 0.45 &&
-        f.trend > 0.6 &&
-        f.accel > 0 &&
-        corr > 0
-      ) {
-        await buy(pair);
-        break;
-      }
-    }
-
-  } catch (e) {
-    console.log("Trade error:", e.message);
   }
+
+  // entries
+  for (const pair of PAIRS) {
+    const f = features(pair);
+    if (!f) continue;
+
+    if (btc && btc.shortTrend < 0) continue;
+    if (!f.whale) continue;
+    if (f.shortTrend < 0.002 || f.longTrend < 0) continue;
+
+    const prob = await predict(f);
+
+    if (prob > 0.65) {
+      await buy(pair, prob, f);
+      break;
+    }
+  }
+
 }, TRADE_INTERVAL);
 
-// ===== START =====
-initDB().then(loadWeights);
+// ===== CONTROL =====
+app.get("/control", auth, async (req, res) => {
+  const trades = await pool.query("SELECT * FROM trades ORDER BY id DESC LIMIT 20");
 
-app.get("/", (req, res) => {
-  res.send("BOT LIVE");
-});
+  const pnl = trades.rows.reduce((a, b) => a + b.profit, 0);
 
-// ===== AUTH =====
-function auth(req, res, next) {
-  const token = req.query.token || req.headers["x-bot-token"];
-  if (token !== process.env.BOT_TOKEN) {
-    return res.status(401).send("Unauthorized");
-  }
-  next();
-}
-
-// ===== CONTROL PANEL =====
-app.get("/control", auth, (req, res) => {
   res.send(`
-    <h2>🤖 BOT CONTROL</h2>
-    <p>Status: ${tradingEnabled ? "ON" : "OFF"}</p>
-    <p>Open Positions: ${positions.length}</p>
+    <h1>💰 FUND MODE BOT</h1>
 
-    <button onclick="fetch('/balance?token=${process.env.BOT_TOKEN}').then(r=>r.json()).then(alert)">
-      Check Balance
-    </button><br><br>
+    <p>Status: ${tradingEnabled ? "🟢 LIVE" : "🔴 OFF"}</p>
+    <p>Equity: ${equity.toFixed(2)}</p>
+    <p>Drawdown: ${(100 - (equity/peakEquity)*100).toFixed(2)}%</p>
+    <p>Losing Streak: ${losingStreak}</p>
 
-    <button onclick="fetch('/toggle?token=${process.env.BOT_TOKEN}').then(r=>r.text()).then(alert)">
-      Toggle Trading
-    </button><br><br>
+    <h3>Positions</h3>
+    ${positions.map(p => `<p>${p.pair} ${(p.confidence*100).toFixed(0)}%</p>`).join("")}
 
-    <button onclick="fetch('/sellall?token=${process.env.BOT_TOKEN}', {method:'POST'}).then(r=>r.text()).then(alert)">
-      SELL ALL
-    </button>
+    <h3>Recent Trades</h3>
+    ${trades.rows.map(t => `<p>${t.pair} ${(t.profit*100).toFixed(2)}%</p>`).join("")}
+
+    <br>
+    <button onclick="fetch('/toggle?token=${BOT_TOKEN}')">Toggle</button>
+    <button onclick="fetch('/sellall?token=${BOT_TOKEN}',{method:'POST'})">Sell All</button>
   `);
 });
 
-// ===== BALANCE =====
-app.get("/balance", auth, async (req, res) => {
-  try {
-    const result = await privateCall("/0/private/Balance");
-    res.json(result);
-  } catch (e) {
-    res.status(500).send(e.message);
-  }
-});
+// ===== ROUTES =====
+app.get("/", (req, res) => res.send("FUND BOT LIVE"));
 
-// ===== TOGGLE =====
 app.get("/toggle", auth, (req, res) => {
   tradingEnabled = !tradingEnabled;
   res.send("Trading: " + tradingEnabled);
 });
 
-// ===== SELL ALL =====
 app.post("/sellall", auth, async (req, res) => {
-  try {
-    for (const pos of positions) {
-      const price = history[pos.pair].slice(-1)[0];
-      await closePosition(pos, price);
-    }
-    positions = [];
-    res.send("All positions closed");
-  } catch (e) {
-    res.status(500).send(e.message);
+  for (const pos of positions) {
+    const price = history[pos.pair].prices.slice(-1)[0];
+    await close(pos, price);
   }
+  positions = [];
+  res.send("Closed");
 });
 
-app.listen(PORT, () => console.log("BOT RUNNING"));
-
-// ===== ROOT =====
-app.get("/", (req, res) => {
-  res.send("BOT LIVE");
-});
+// ===== START =====
+initDB();
+app.listen(PORT, () => console.log("💰 FUND BOT RUNNING"));
