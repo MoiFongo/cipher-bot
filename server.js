@@ -6,14 +6,21 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
 const KEY = process.env.KRAKEN_KEY;
 const SECRET = process.env.KRAKEN_SECRET;
-
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const API = "https://api.kraken.com";
 
+function requireAuth(req, res, next) {
+  const token = req.headers["x-bot-token"];
+  if (!BOT_TOKEN || token !== BOT_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
 function sign(path, request, secret) {
-  const secret_buffer = Buffer.from(secret, "base64");
+  const secretBuffer = Buffer.from(secret, "base64");
   const nonce = request.nonce;
   const postData = new URLSearchParams(request).toString();
 
@@ -23,18 +30,20 @@ function sign(path, request, secret) {
     .digest();
 
   return crypto
-    .createHmac("sha512", secret_buffer)
+    .createHmac("sha512", secretBuffer)
     .update(path)
     .update(hash)
     .digest("base64");
 }
 
 async function privateCall(path, params = {}) {
-  const nonce = Date.now().toString();
+  if (!KEY || !SECRET) {
+    throw new Error("Missing Kraken credentials");
+  }
 
+  const nonce = Date.now().toString();
   const body = { nonce, ...params };
   const postData = new URLSearchParams(body).toString();
-
   const sig = sign(path, body, SECRET);
 
   const res = await fetch(API + path, {
@@ -60,10 +69,14 @@ async function getPrice(pair) {
 }
 
 app.get("/", (req, res) => {
-  res.send("CIPHER BOT LIVE 🚀");
+  res.send("CIPHER BOT LIVE");
 });
 
-app.get("/balance", async (req, res) => {
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
+
+app.get("/balance", requireAuth, async (req, res) => {
   try {
     const bal = await privateCall("/0/private/Balance");
     res.json(bal);
@@ -72,11 +85,15 @@ app.get("/balance", async (req, res) => {
   }
 });
 
-app.post("/buy", async (req, res) => {
+app.post("/buy", requireAuth, async (req, res) => {
   try {
     const { pair, usd } = req.body;
+    if (!pair || !usd) {
+      return res.status(400).json({ error: "pair and usd are required" });
+    }
+
     const price = await getPrice(pair);
-    const volume = (usd / price).toFixed(8);
+    const volume = (Number(usd) / price).toFixed(8);
 
     const result = await privateCall("/0/private/AddOrder", {
       pair,
@@ -91,9 +108,12 @@ app.post("/buy", async (req, res) => {
   }
 });
 
-app.post("/sell", async (req, res) => {
+app.post("/sell", requireAuth, async (req, res) => {
   try {
     const { pair, volume } = req.body;
+    if (!pair || !volume) {
+      return res.status(400).json({ error: "pair and volume are required" });
+    }
 
     const result = await privateCall("/0/private/AddOrder", {
       pair,
@@ -108,10 +128,10 @@ app.post("/sell", async (req, res) => {
   }
 });
 
-app.post("/cancel-all", async (req, res) => {
+app.post("/cancel-all", requireAuth, async (req, res) => {
   try {
     const result = await privateCall("/0/private/CancelAll");
-    res.json(result);
+    res.json({ ok: true, result });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
