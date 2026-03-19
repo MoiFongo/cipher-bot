@@ -333,6 +333,66 @@ app.get("/", (req, res) => {
   res.send("BOT LIVE");
 });
 
+// ===== AUTH =====
+function auth(req, res, next) {
+  const token = req.query.token || req.headers["x-bot-token"];
+  if (token !== process.env.BOT_TOKEN) {
+    return res.status(401).send("Unauthorized");
+  }
+  next();
+}
+
+// ===== CONTROL PANEL =====
+app.get("/control", auth, (req, res) => {
+  res.send(`
+    <h2>🤖 BOT CONTROL</h2>
+    <p>Status: ${tradingEnabled ? "ON" : "OFF"}</p>
+    <p>Open Positions: ${positions.length}</p>
+
+    <button onclick="fetch('/balance?token=${process.env.BOT_TOKEN}').then(r=>r.json()).then(alert)">
+      Check Balance
+    </button><br><br>
+
+    <button onclick="fetch('/toggle?token=${process.env.BOT_TOKEN}').then(r=>r.text()).then(alert)">
+      Toggle Trading
+    </button><br><br>
+
+    <button onclick="fetch('/sellall?token=${process.env.BOT_TOKEN}', {method:'POST'}).then(r=>r.text()).then(alert)">
+      SELL ALL
+    </button>
+  `);
+});
+
+// ===== BALANCE =====
+app.get("/balance", auth, async (req, res) => {
+  try {
+    const result = await privateCall("/0/private/Balance");
+    res.json(result);
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
+});
+
+// ===== TOGGLE =====
+app.get("/toggle", auth, (req, res) => {
+  tradingEnabled = !tradingEnabled;
+  res.send("Trading: " + tradingEnabled);
+});
+
+// ===== SELL ALL =====
+app.post("/sellall", auth, async (req, res) => {
+  try {
+    for (const pos of positions) {
+      const price = history[pos.pair].slice(-1)[0];
+      await closePosition(pos, price);
+    }
+    positions = [];
+    res.send("All positions closed");
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
+});
+
 app.listen(PORT, () => console.log("BOT RUNNING"));
 
 // ===== ROOT =====
