@@ -14,6 +14,8 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const API = "https://api.kraken.com";
 
+console.log("KEY starts:", KEY?.slice(0,4), "ends:", KEY?.slice(-4), "length:", KEY?.length);
+
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 async function initDB() {
@@ -160,9 +162,7 @@ setInterval(async () => {
     const market = await getMarket();
     for (const pair of PAIRS) updateHistory(pair, market[pair].price, market[pair].volume);
     console.log(`📊 BTC $${market["BTC/USD"].price} | ETH $${market["ETH/USD"].price} | SOL $${market["SOL/USD"].price}`);
-
     const btc = features("BTC/USD");
-
     for (let i = positions.length - 1; i >= 0; i--) {
       const pos = positions[i];
       const price = history[pos.pair]?.prices?.at(-1);
@@ -176,9 +176,7 @@ setInterval(async () => {
         positions.splice(i, 1);
       }
     }
-
     if (!tradingEnabled) { console.log("⏸ Bot paused"); return; }
-
     for (const pair of PAIRS) {
       const f = features(pair);
       if (!f) { console.log(`⏳ ${pair} waiting for data...`); continue; }
