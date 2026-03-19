@@ -206,11 +206,47 @@ setInterval(async () => {
         if (opened) break;
       }
     }
+setInterval(async () => {
+  try {
+    const market = await getMarket();
+    for (const pair of PAIRS) updateHistory(pair, market[pair].price, market[pair].volume);
+    
+    const btc = features("BTC/USD");
+    console.log(`📊 BTC $${market["BTC/USD"].price} | ETH $${market["ETH/USD"].price} | SOL $${market["SOL/USD"].price}`);
+
+    for (let i = positions.length - 1; i >= 0; i--) {
+      const pos = positions[i];
+      const price = history[pos.pair]?.prices?.at(-1);
+      if (!price) continue;
+      if (price > pos.peak) pos.peak = price;
+      const dd = price / pos.peak;
+      const ageMs = Date.now() - pos.openedAt;
+      if (dd < 0.985 || price < pos.entry * 0.99 || ageMs > 30 * 60 * 1000) {
+        console.log(`🔴 Closing ${pos.pair} at $${price}`);
+        await close(pos, price);
+        positions.splice(i, 1);
+      }
+    }
+
+    if (!tradingEnabled) { console.log("⏸ Bot paused"); return; }
+
+    for (const pair of PAIRS) {
+      const f = features(pair);
+      if (!f) { console.log(`⏳ ${pair} waiting for data...`); continue; }
+      if (btc && btc.shortTrend < 0) { console.log(`📉 BTC downtrend, skipping`); break; }
+      if (!f.whale) { console.log(`🐟 ${pair} no whale volume`); continue; }
+      if (f.shortTrend < 0.002 || f.longTrend < 0) { console.log(`📉 ${pair} trend too weak`); continue; }
+      const prob = await predict(f);
+      console.log(`🤖 ${pair} confidence: ${(prob*100).toFixed(1)}%`);
+      if (prob > 0.65) {
+        const opened = await buy(pair, prob, f);
+        if (opened) { console.log(`🟢 Opened position on ${pair}`); break; }
+      }
+    }
   } catch (err) {
     console.log("loop error:", err.message);
   }
 }, TRADE_INTERVAL);
-
 app.get("/", (req, res) => res.send("FUND BOT LIVE"));
 
 app.get("/api/status", auth, async (req, res) => {
