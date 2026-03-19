@@ -66,20 +66,31 @@ async function privateCall(path, params = {}) {
 }
 
 async function getMarket() {
-  const pairs = PAIRS.map((p) => p.replace("/", "")).join(",");
+  const krakenPairs = {
+    "BTC/USD": "XXBTZUSD",
+    "ETH/USD": "XETHZUSD",
+    "SOL/USD": "SOLUSD",
+    "XRP/USD": "XXRPZUSD",
+    "ADA/USD": "ADAUSD",
+    "DOGE/USD": "XDGEZUSD",
+    "LINK/USD": "LINKUSD",
+    "XMR/USD": "XXMRZUSD",
+    "BCH/USD": "BCHUSD",
+    "XLM/USD": "XXLMZUSD",
+    "TRX/USD": "TRXUSD"
+  };
+  const pairs = Object.values(krakenPairs).join(",");
   const res = await fetch(`${API}/0/public/Ticker?pair=${pairs}`);
   const data = await res.json();
   if (data.error?.length) throw new Error(data.error.join(", "));
   const out = {};
-  for (const pair of PAIRS) {
-    const key = pair.replace("/", "");
-    const match = Object.keys(data.result).find(k => k.includes(key.slice(0,3)));
-    if (!match) continue;
+  for (const [pair, krakenKey] of Object.entries(krakenPairs)) {
+    if (!data.result[krakenKey]) continue;
     out[pair] = {
-      price: parseFloat(data.result[match].c[0]),
-      volume: parseFloat(data.result[match].v[1]),
-      change24h: parseFloat(data.result[match].p[1]) > 0
-        ? (parseFloat(data.result[match].c[0]) - parseFloat(data.result[match].p[1])) / parseFloat(data.result[match].p[1])
+      price: parseFloat(data.result[krakenKey].c[0]),
+      volume: parseFloat(data.result[krakenKey].v[1]),
+      change24h: parseFloat(data.result[krakenKey].p[1]) > 0
+        ? (parseFloat(data.result[krakenKey].c[0]) - parseFloat(data.result[krakenKey].p[1])) / parseFloat(data.result[krakenKey].p[1])
         : 0
     };
   }
