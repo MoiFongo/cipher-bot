@@ -25,6 +25,21 @@ async function initDB() {
 }
 
 const PAIRS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD", "DOGE/USD", "LINK/USD", "XMR/USD", "BCH/USD", "XLM/USD", "TRX/USD"];
+
+const KRAKEN_PAIRS = {
+  "BTC/USD": "XBTUSD",
+  "ETH/USD": "ETHUSD",
+  "SOL/USD": "SOLUSD",
+  "XRP/USD": "XRPUSD",
+  "ADA/USD": "ADAUSD",
+  "DOGE/USD": "DOGEUSD",
+  "LINK/USD": "LINKUSD",
+  "XMR/USD": "XMRUSD",
+  "BCH/USD": "BCHUSD",
+  "XLM/USD": "XLMUSD",
+  "TRX/USD": "TRXUSD"
+};
+
 const BASE_RISK = 0.01;
 const MAX_POSITIONS = 4;
 const TRADE_INTERVAL = 7000;
@@ -66,31 +81,19 @@ async function privateCall(path, params = {}) {
 }
 
 async function getMarket() {
-  const krakenPairs = {
-    "BTC/USD": "XXBTZUSD",
-    "ETH/USD": "XETHZUSD",
-    "SOL/USD": "SOLUSD",
-    "XRP/USD": "XXRPZUSD",
-    "ADA/USD": "ADAUSD",
-    "DOGE/USD": "XDGEZUSD",
-    "LINK/USD": "LINKUSD",
-    "XMR/USD": "XXMRZUSD",
-    "BCH/USD": "BCHUSD",
-    "XLM/USD": "XXLMZUSD",
-    "TRX/USD": "TRXUSD"
-  };
-  const pairs = Object.values(krakenPairs).join(",");
+  const pairs = Object.values(KRAKEN_PAIRS).join(",");
   const res = await fetch(`${API}/0/public/Ticker?pair=${pairs}`);
   const data = await res.json();
   if (data.error?.length) throw new Error(data.error.join(", "));
   const out = {};
-  for (const [pair, krakenKey] of Object.entries(krakenPairs)) {
-    if (!data.result[krakenKey]) continue;
+  for (const [pair, krakenKey] of Object.entries(KRAKEN_PAIRS)) {
+    const result = data.result[krakenKey] || Object.values(data.result).find((_, i) => Object.keys(data.result)[i].includes(krakenKey.slice(0,3)));
+    if (!result) continue;
     out[pair] = {
-      price: parseFloat(data.result[krakenKey].c[0]),
-      volume: parseFloat(data.result[krakenKey].v[1]),
-      change24h: parseFloat(data.result[krakenKey].p[1]) > 0
-        ? (parseFloat(data.result[krakenKey].c[0]) - parseFloat(data.result[krakenKey].p[1])) / parseFloat(data.result[krakenKey].p[1])
+      price: parseFloat(result.c[0]),
+      volume: parseFloat(result.v[1]),
+      change24h: parseFloat(result.p[1]) > 0
+        ? (parseFloat(result.c[0]) - parseFloat(result.p[1])) / parseFloat(result.p[1])
         : 0
     };
   }
@@ -149,13 +152,13 @@ async function buy(pair, conf, f) {
   const risk = calcPositionSize(conf);
   const capital = equity * risk;
   const volume = (capital / price).toFixed(8);
-  await privateCall("/0/private/AddOrder", { pair, type: "buy", ordertype: "market", volume });
+  await privateCall("/0/private/AddOrder", { pair: KRAKEN_PAIRS[pair], type: "buy", ordertype: "market", volume });
   positions.push({ pair, entry: price, volume, peak: price, confidence: conf, features: f, capital, openedAt: Date.now() });
   return true;
 }
 
 async function close(pos, price) {
-  await privateCall("/0/private/AddOrder", { pair: pos.pair, type: "sell", ordertype: "market", volume: pos.volume });
+  await privateCall("/0/private/AddOrder", { pair: KRAKEN_PAIRS[pos.pair], type: "sell", ordertype: "market", volume: pos.volume });
   const profit = (price - pos.entry) / pos.entry;
   equity *= 1 + profit;
   if (equity > peakEquity) peakEquity = equity;
