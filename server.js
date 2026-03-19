@@ -14,8 +14,6 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const API = "https://api.kraken.com";
 
-console.log("KEY starts:", KEY?.slice(0,4), "ends:", KEY?.slice(-4), "length:", KEY?.length);
-
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 async function initDB() {
@@ -26,7 +24,7 @@ async function initDB() {
   );`);
 }
 
-const PAIRS = ["BTC/USD", "ETH/USD", "SOL/USD"];
+const PAIRS = ["BTC/USD","ETH/USD","SOL/USD","XRP/USD","ADA/USD","DOGE/USD","LINK/USD","XMR/USD","BCH/USD","XLM/USD","TRX/USD"];
 const BASE_RISK = 0.01;
 const MAX_POSITIONS = 4;
 const TRADE_INTERVAL = 7000;
@@ -68,21 +66,22 @@ async function privateCall(path, params = {}) {
 }
 
 async function getMarket() {
-  const pairs = PAIRS.map((p) => p.replace("/", "")).join(",");
-  const res = await fetch(`${API}/0/public/Ticker?pair=${pairs}`);
+  const krakenPairs = PAIRS.map((p) => p.replace("/", ""));
+  const res = await fetch(`${API}/0/public/Ticker?pair=${krakenPairs.join(",")}`);
   const data = await res.json();
   if (data.error?.length) throw new Error(data.error.join(", "));
   const out = {};
-  let i = 0;
-  for (const key in data.result) {
-    out[PAIRS[i]] = {
-      price: parseFloat(data.result[key].c[0]),
-      volume: parseFloat(data.result[key].v[1]),
-      change24h: parseFloat(data.result[key].p[1]) > 0
-        ? (parseFloat(data.result[key].c[0]) - parseFloat(data.result[key].p[1])) / parseFloat(data.result[key].p[1])
+  for (const pair of PAIRS) {
+    const base = pair.split("/")[0];
+    const match = Object.keys(data.result).find(k => k.startsWith(base) || k.startsWith("X"+base) || k.startsWith("Z"+base));
+    if (!match) { console.log(`⚠️ No match for ${pair}`); continue; }
+    out[pair] = {
+      price: parseFloat(data.result[match].c[0]),
+      volume: parseFloat(data.result[match].v[1]),
+      change24h: parseFloat(data.result[match].p[1]) > 0
+        ? (parseFloat(data.result[match].c[0]) - parseFloat(data.result[match].p[1])) / parseFloat(data.result[match].p[1])
         : 0
     };
-    i++;
   }
   return out;
 }
@@ -107,7 +106,10 @@ function features(pair) {
   const longTrend = (long[long.length - 1] - long[0]) / long[0];
   const volAvg = vols.reduce((a, b) => a + b, 0) / vols.length;
   const whale = h.volumes[h.volumes.length - 1] > volAvg * 1.8;
-  return { shortTrend, longTrend, whale };
+  const mid = h.prices.slice(-10);
+  const midTrend = (mid[mid.length - 1] - mid[0]) / mid[0];
+  const fakeBreakout = shortTrend > 0.003 && midTrend < 0;
+  return { shortTrend, longTrend, whale, fakeBreakout };
 }
 
 async function predict(f) {
@@ -160,8 +162,11 @@ async function close(pos, price) {
 setInterval(async () => {
   try {
     const market = await getMarket();
-    for (const pair of PAIRS) updateHistory(pair, market[pair].price, market[pair].volume);
-    console.log(`📊 BTC $${market["BTC/USD"].price} | ETH $${market["ETH/USD"].price} | SOL $${market["SOL/USD"].price}`);
+    for (const pair of PAIRS) {
+      if (market[pair]) updateHistory(pair, market[pair].price, market[pair].volume);
+    }
+    const prices = PAIRS.filter(p => market[p]).map(p => `${p.split("/")[0]} $${market[p].price}`).join(" | ");
+    console.log(`📊 ${prices}`);
     const btc = features("BTC/USD");
     for (let i = positions.length - 1; i >= 0; i--) {
       const pos = positions[i];
@@ -180,8 +185,9 @@ setInterval(async () => {
     for (const pair of PAIRS) {
       const f = features(pair);
       if (!f) { console.log(`⏳ ${pair} waiting for data...`); continue; }
-      if (btc && btc.shortTrend < 0) { console.log(`📉 BTC downtrend, skipping`); break; }
+      if (btc && btc.shortTrend < 0) { console.log(`📉 BTC downtrend, skipping all`); break; }
       if (!f.whale) { console.log(`🐟 ${pair} no whale volume`); continue; }
+      if (f.fakeBreakout) { console.log(`🚫 ${pair} fake breakout detected`); continue; }
       if (f.shortTrend < 0.002 || f.longTrend < 0) { console.log(`📉 ${pair} trend too weak`); continue; }
       const prob = await predict(f);
       console.log(`🤖 ${pair} confidence: ${(prob * 100).toFixed(1)}%`);
@@ -292,7 +298,7 @@ pre{white-space:pre-wrap;word-break:break-word;font-size:12px;color:#d4dae4}
   </div>
   <div class="section grid">
     <div class="card"><h3>📈 Equity Curve</h3><div class="canvasBox"><canvas id="equityChart"></canvas></div></div>
-    <div class="card"><h3>₿ BTC / ⟠ ETH / ◎ SOL</h3><div class="canvasBox"><canvas id="priceChart"></canvas></div></div>
+    <div class="card"><h3>📊 BTC / ETH / SOL</h3><div class="canvasBox"><canvas id="priceChart"></canvas></div></div>
   </div>
   <div class="section grid">
     <div class="card"><h3>📍 Active Positions</h3><div id="positions" class="list"></div></div>
