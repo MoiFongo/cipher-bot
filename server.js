@@ -20,13 +20,17 @@ const STOP_LOSS = 0.98;
 const TAKE_PROFIT = 1.02;
 const COOLDOWN_MS = 2 * 60 * 1000;
 
+// ===== LOOP SPEEDS =====
+const DATA_INTERVAL = 2500;   // 2.5 sec (price updates)
+const TRADE_INTERVAL = 10000; // 10 sec (decision making)
+
 // ===== STATE =====
 let history = {};
 let openPosition = null;
 let lastTradeTime = 0;
 let tradingEnabled = true;
 
-// ===== ML MODEL =====
+// ===== ML =====
 let weights = {
   momentum: 0.4,
   volatility: -0.2,
@@ -41,7 +45,7 @@ function auth(req, res, next) {
   next();
 }
 
-// ===== KRAKEN SIGN =====
+// ===== SIGN =====
 function sign(path, request, secret) {
   const secretBuffer = Buffer.from(secret, "base64");
   const nonce = request.nonce;
@@ -57,7 +61,7 @@ function sign(path, request, secret) {
     .digest("base64");
 }
 
-// ===== PRIVATE API =====
+// ===== PRIVATE =====
 async function privateCall(path, params = {}) {
   const nonce = Date.now().toString();
   const body = { nonce, ...params };
@@ -79,12 +83,21 @@ async function privateCall(path, params = {}) {
   return data.result;
 }
 
-// ===== PRICE =====
-async function getPrice(pair) {
-  const res = await fetch(`${API}/0/public/Ticker?pair=${pair.replace("/", "")}`);
+// ===== GET ALL PRICES (OPTIMIZED) =====
+async function getAllPrices() {
+  const pairs = PAIRS.map(p => p.replace("/", "")).join(",");
+  const res = await fetch(`${API}/0/public/Ticker?pair=${pairs}`);
   const data = await res.json();
-  const key = Object.keys(data.result)[0];
-  return parseFloat(data.result[key].c[0]);
+
+  let prices = {};
+  let i = 0;
+
+  for (const key in data.result) {
+    prices[PAIRS[i]] = parseFloat(data.result[key].c[0]);
+    i++;
+  }
+
+  return prices;
 }
 
 // ===== HISTORY =====
@@ -127,7 +140,6 @@ function correlation(a, b) {
   return num / Math.sqrt(denA * denB + 1e-8);
 }
 
-// ===== MARKET CORRELATION =====
 function marketCorrelation() {
   return (
     correlation(history["BTC/USD"], history["ETH/USD"]) +
@@ -147,16 +159,16 @@ function score(features, corr) {
 
 // ===== BUY =====
 async function buy(pair) {
-  if (!tradingEnabled) throw new Error("Trading disabled");
-  if (openPosition) throw new Error("Position exists");
+  if (!tradingEnabled) return;
+  if (openPosition) return;
 
   const now = Date.now();
-  if (now - lastTradeTime < COOLDOWN_MS) throw new Error("Cooldown");
+  if (now - lastTradeTime < COOLDOWN_MS) return;
 
-  const price = await getPrice(pair);
+  const price = history[pair].slice(-1)[0];
   const volume = (MAX_TRADE_USD / price).toFixed(8);
 
-  const result = await privateCall("/0/private/AddOrder", {
+  await privateCall("/0/private/AddOrder", {
     pair,
     type: "buy",
     ordertype: "market",
@@ -172,68 +184,68 @@ async function buy(pair) {
   };
 
   lastTradeTime = now;
-  return result;
+  console.log("BOUGHT:", pair);
 }
 
 // ===== SELL =====
 async function sell() {
-  if (!openPosition) throw new Error("No position");
+  if (!openPosition) return;
 
   const { pair, volume, entry, features, corr } = openPosition;
-  const exitPrice = await getPrice(pair);
+  const price = history[pair].slice(-1)[0];
 
-  const result = await privateCall("/0/private/AddOrder", {
+  await privateCall("/0/private/AddOrder", {
     pair,
     type: "sell",
     ordertype: "market",
     volume
   });
 
-  const profit = (exitPrice - entry) / entry;
+  const profit = (price - entry) / entry;
   const lr = 0.05;
 
-  // ===== LEARNING =====
   weights.momentum += lr * profit * features.momentum;
   weights.volatility += lr * profit * features.volatility;
   weights.correlation += lr * profit * corr;
 
-  console.log("Updated weights:", weights);
+  console.log("SOLD:", pair, "profit:", profit);
+  console.log("New weights:", weights);
 
   openPosition = null;
-  return result;
 }
 
-// ===== AUTO MONITOR =====
+// ===== FAST DATA LOOP (2.5s) =====
 setInterval(async () => {
   try {
-    if (!openPosition) return;
+    const prices = await getAllPrices();
 
-    const price = await getPrice(openPosition.pair);
-
-    if (price >= openPosition.entry * TAKE_PROFIT) {
-      console.log("TP hit");
-      await sell();
-    }
-
-    if (price <= openPosition.entry * STOP_LOSS) {
-      console.log("SL hit");
-      await sell();
+    for (const pair of PAIRS) {
+      updateHistory(pair, prices[pair]);
     }
 
   } catch (e) {
-    console.log("Monitor error:", e.message);
+    console.log("Data error:", e.message);
   }
-}, 5000);
+}, DATA_INTERVAL);
 
-// ===== AUTO SCAN =====
+// ===== TRADE LOOP (10s) =====
 setInterval(async () => {
   try {
-    for (const pair of PAIRS) {
-      const price = await getPrice(pair);
-      updateHistory(pair, price);
-    }
+    if (openPosition) {
+      const price = history[openPosition.pair].slice(-1)[0];
 
-    if (openPosition) return;
+      if (price >= openPosition.entry * TAKE_PROFIT) {
+        console.log("TP hit");
+        await sell();
+      }
+
+      if (price <= openPosition.entry * STOP_LOSS) {
+        console.log("SL hit");
+        await sell();
+      }
+
+      return;
+    }
 
     const corr = marketCorrelation();
 
@@ -243,31 +255,29 @@ setInterval(async () => {
 
       const s = score(features, corr);
 
-      if (s > 0.5) {
-        console.log("ML BUY:", pair, s);
+      if (s > 0.4) { // slightly aggressive for learning
+        console.log("BUY SIGNAL:", pair, s);
         await buy(pair);
         break;
       }
     }
 
   } catch (e) {
-    console.log("Scan error:", e.message);
+    console.log("Trade error:", e.message);
   }
-}, 10000);
+}, TRADE_INTERVAL);
 
 // ===== ROUTES =====
-
 app.get("/", (req, res) => res.send("BOT LIVE"));
 
 app.get("/control", auth, (req, res) => {
   res.send(`
-    <h2>CIPHER CONTROL</h2>
-    <p>Status: ${tradingEnabled ? "ON" : "OFF"}</p>
+    <h2>BOT CONTROL</h2>
+    <p>Status: ${tradingEnabled}</p>
     <p>Position: ${openPosition ? openPosition.pair : "None"}</p>
 
     <button onclick="fetch('/balance?token=${BOT_TOKEN}').then(r=>r.json()).then(alert)">Balance</button>
     <button onclick="fetch('/toggle?token=${BOT_TOKEN}').then(r=>r.text()).then(alert)">Toggle</button>
-
     <button onclick="fetch('/sell?token=${BOT_TOKEN}',{method:'POST'}).then(r=>r.json()).then(alert)">SELL</button>
   `);
 });
@@ -282,12 +292,8 @@ app.get("/balance", auth, async (req, res) => {
 });
 
 app.post("/sell", auth, async (req, res) => {
-  try {
-    const r = await sell();
-    res.json(r);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  await sell();
+  res.send("Sold");
 });
 
 app.get("/toggle", auth, (req, res) => {
